@@ -190,12 +190,20 @@ local state = {
 	helpPagination = nil,
 	diagnostics = {},
 	diagnosticsExpanded = false,
-	showEditorBorder = true
+	showEditorBorder = true,
+	showHomeScreen = true,
+	maxRecentFiles = 12
 }
 
 local app = pixelui.create({ background = colors.black })
 local root = app:getRoot()
 root:setBorder({ color = colors.gray })
+
+-- Forward declarations
+local updateMainVisibility
+
+-- Forward declarations
+local updateMainVisibility
 
 local rootWidth, rootHeight = root.width, root.height
 local editorHeight = math.max(1, rootHeight - 2)
@@ -347,6 +355,36 @@ local function applyEditorBorder()
 	end
 end
 
+local function formatFileDate(path)
+	if not fs.exists(path) then
+		return "(missing)"
+	end
+	local attrs = fs.attributes and fs.attributes(path)
+	if attrs and attrs.modified then
+		local date = os.date("%m/%d %H:%M", attrs.modified)
+		return date or "(unknown)"
+	end
+	return "(no date)"
+end
+
+local function getFileSize(path)
+	if not fs.exists(path) then
+		return 0
+	end
+	local size = fs.getSize and fs.getSize(path)
+	return size or 0
+end
+
+local function hideHomeScreen()
+	state.showHomeScreen = false
+	if updateMainVisibility then updateMainVisibility() end
+end
+
+local function showHomeScreen()
+	state.showHomeScreen = true
+	if updateMainVisibility then updateMainVisibility() end
+end
+
 local function parseSyntaxError(err)
 	if not err or err == "" then
 		return nil, "syntax error"
@@ -442,8 +480,141 @@ end
 if diagnosticsToggleButton then
 	diagnosticsToggleButton.onClick = toggleDiagnosticsPanel
 end
+
+
+
 layoutEditorAndDiagnostics()
 applyEditorBorder()
+
+-- Home Screen Components
+local homeFrame = app:createFrame({
+	x = 1,
+	y = 1,
+	width = rootWidth,
+	height = rootHeight,
+	bg = colors.black,
+	fg = colors.white
+})
+homeFrame.visible = false
+root:addChild(homeFrame)
+
+local homeTitle = app:createLabel({
+	x = 1,
+	y = 2,
+	width = rootWidth,
+	height = 1,
+	text = "CCIDE - CC:Tweaked IDE",
+	align = "center",
+	bg = colors.black,
+	fg = colors.white
+})
+homeFrame:addChild(homeTitle)
+
+local homeSubtitle = app:createLabel({
+	x = 1,
+	y = 3,
+	width = rootWidth,
+	height = 1,
+	text = "Choose a file to edit or start a new project",
+	align = "center",
+	bg = colors.black,
+	fg = colors.lightGray
+})
+homeFrame:addChild(homeSubtitle)
+
+local newFileButton = app:createButton({
+	x = math.floor(rootWidth / 2) - 8,
+	y = 5,
+	width = 16,
+	height = 3,
+	label = "New File",
+	bg = colors.blue,
+	fg = colors.white,
+	border = { color = colors.lightBlue }
+})
+newFileButton.focusable = true
+homeFrame:addChild(newFileButton)
+
+local openFileButton = app:createButton({
+	x = math.floor(rootWidth / 2) - 8,
+	y = 9,
+	width = 16,
+	height = 3,
+	label = "Open File...",
+	bg = colors.green,
+	fg = colors.white,
+	border = { color = colors.lime }
+})
+openFileButton.focusable = true
+homeFrame:addChild(openFileButton)
+
+local recentLabel = app:createLabel({
+	x = 2,
+	y = 14,
+	width = rootWidth - 2,
+	height = 1,
+	text = "Recent Files:",
+	align = "left",
+	bg = colors.black,
+	fg = colors.white
+})
+homeFrame:addChild(recentLabel)
+
+local recentListHeight = math.max(3, rootHeight - 16)
+local recentList = app:createList({
+	x = 2,
+	y = 15,
+	width = rootWidth - 2,
+	height = recentListHeight,
+	bg = colors.black,
+	fg = colors.white,
+	highlightBg = colors.blue,
+	highlightFg = colors.white,
+	placeholder = "(no recent files)",
+	scrollbar = { enabled = true, trackColor = colors.black, thumbColor = colors.gray },
+	border = { color = colors.gray }
+})
+recentList.focusable = true
+homeFrame:addChild(recentList)
+
+-- Function to update home screen layout when app is resized
+local function updateHomeScreenLayout()
+	local currentWidth, currentHeight = root:getSize()
+	if homeFrame then
+		homeFrame:setSize(currentWidth, currentHeight)
+		homeTitle:setSize(currentWidth, 1)
+		homeSubtitle:setSize(currentWidth, 1)
+		
+		-- Center the buttons
+		local buttonX = math.floor(currentWidth / 2) - 8
+		newFileButton:setPosition(buttonX, 5)
+		openFileButton:setPosition(buttonX, 9)
+		
+		-- Update recent files section
+		recentLabel:setSize(currentWidth - 2, 1)
+		local newRecentListHeight = math.max(3, currentHeight - 16)
+		recentList:setSize(currentWidth - 2, newRecentListHeight)
+	end
+end
+
+local function refreshHomeScreen()
+	if not state.showHomeScreen or not homeFrame.visible then
+		return
+	end
+	local items = {}
+	for i = 1, #state.recentFiles do
+		local path = state.recentFiles[i]
+		local name = fs.getName(path) or path
+		local size = getFileSize(path)
+		local date = formatFileDate(path)
+		local sizeStr = size > 0 and string.format("(%d bytes)", size) or ""
+		local display = string.format("%s %s %s", name, sizeStr, date)
+		items[#items + 1] = truncate(display, recentList.width - 4)
+	end
+	recentList:setItems(items)
+end
+
+-- Button callbacks will be set after function declarations
 
 local function showFileDialog(options)
 		options = options or {}
@@ -982,7 +1153,8 @@ local function showFileDialog(options)
 		end
 
 		local helpItems = {
-			"File menu: Create new files, open existing ones, save, and manage recents.",
+			"Home screen: Shows recent files and options to create or open files.",
+			"File menu: Access home, create new files, open existing ones, save, and manage recents.",
 			"View menu: Toggle the status bar visibility and the editor border.",
 			"Edit menu: Trim whitespace, duplicate lines, go to a line, or revert to saved.",
 			"Settings menu: Enable or disable autocomplete and change the tab width.",
@@ -1362,6 +1534,7 @@ local function showFileDialog(options)
 	end
 
 	local function prepareEmptyBuffer(name, pendingPath)
+		hideHomeScreen()
 		editor:setText("", true)
 		editor:_moveCursorToIndex(1)
 		state.savedText = ""
@@ -1437,6 +1610,7 @@ local function showFileDialog(options)
 			showError("Open Failed", "Cannot open a directory")
 			return false
 		end
+		hideHomeScreen()
 		local handle, err = fs.open(normalized, "r")
 		if not handle then
 			showError("Open Failed", err or "Unable to read file")
@@ -1713,6 +1887,10 @@ local function showFileDialog(options)
 
 	local function buildFileMenuItems()
 		local items = {
+			{ label = "Home", onSelect = function()
+				showHomeScreen()
+			end },
+			"-",
 			{ label = "New", onSelect = function()
 				newUntitled()
 			end },
@@ -1934,8 +2112,71 @@ local function showFileDialog(options)
 		end
 	end
 
+	updateMainVisibility = function()
+		local showMain = not state.showHomeScreen
+		editor.visible = showMain
+		statusLabel.visible = showMain and state.showStatusBar
+		if diagnosticsToggleButton then
+			diagnosticsToggleButton.visible = showMain and state.showStatusBar and diagnosticsPanelHeight > 0
+		end
+		if diagnosticsPanel then
+			diagnosticsPanel.visible = showMain and state.diagnosticsExpanded
+		end
+		for _, button in pairs(topButtons or {}) do
+			if button and button.visible ~= nil then
+				button.visible = showMain
+			end
+		end
+		if menuBar then
+			menuBar.visible = showMain
+		end
+		if homeFrame then
+			homeFrame.visible = state.showHomeScreen
+			if state.showHomeScreen then
+				updateHomeScreenLayout()
+				refreshHomeScreen()
+				app:setFocus(newFileButton)
+			end
+		end
+	end
+
+	-- Initialize home screen visibility
+	updateMainVisibility()	-- Set up home screen button callbacks
+	if newFileButton then
+		newFileButton.onClick = function()
+			hideHomeScreen()
+			newUntitled()
+		end
+	end
+
+	if openFileButton then
+		openFileButton.onClick = function()
+			hideHomeScreen()
+			openFileWorkflow()
+		end
+	end
+
+	if recentList then
+		recentList:setOnSelect(function(_, _, index)
+			if not index or index < 1 or index > #state.recentFiles then
+				return
+			end
+			local path = state.recentFiles[index]
+			if not path then
+				return
+			end
+			hideHomeScreen()
+			confirmUnsaved(function()
+				loadFile(path)
+			end)
+		end)
+	end
+
 	editor:setOnChange(function(_, text)
 		updateDirtyState(text or "")
+		if text and text ~= "" and state.showHomeScreen then
+			hideHomeScreen()
+		end
 		updateStatus()
 		scheduleDiagnosticsUpdate()
 	end)
@@ -1957,15 +2198,54 @@ local function showFileDialog(options)
 					state.displayName = fs.getName(pending)
 					updateStatus()
 				end
+				-- Show home screen only if we have an empty file with no specific path
+				state.showHomeScreen = not pending and editor:getText() == ""
+			else
+				-- File was loaded successfully, don't show home screen
+				state.showHomeScreen = false
 			end
 		else
 			prepareEmptyBuffer(state.displayName or "Untitled-1", nil)
+			-- Show home screen for empty untitled files with no arguments
+			state.showHomeScreen = true
 		end
 	end
 
 	initializeFromArgs()
 	updateStatus()
-	app:setFocus(editor)
+	updateMainVisibility()
+	if state.showHomeScreen then
+		app:setFocus(newFileButton)
+	else
+		app:setFocus(editor)
+	end
+	
+	-- Set up resize handler for responsive layout
+		root:setOnSizeChange(function(_, newWidth, newHeight)
+			rootWidth = newWidth
+			rootHeight = newHeight
+			statusBarY = newHeight
+			if menuBar then
+				menuBar:setSize(rootWidth, 1)
+			end
+			if statusLabel then
+				statusLabel:setPosition(1, statusBarY)
+				statusLabel:setSize(math.max(1, rootWidth - 1), 1)
+			end
+			if diagnosticsToggleButton and statusLabel then
+				diagnosticsToggleButton:setPosition(statusLabel.x + statusLabel.width, statusBarY)
+			end
+			maxDiagHeight = math.max(0, rootHeight - 3)
+			diagnosticsPanelHeight = math.min(5, maxDiagHeight)
+			updateHomeScreenLayout()
+			layoutEditorAndDiagnostics()
+			refreshHomeScreen()
+			updateStatus()
+			if app and app.render then
+				app:render()
+			end
+		end)
+	
 	app:run()
 
 	if app.destroy then

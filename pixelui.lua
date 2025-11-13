@@ -3129,6 +3129,13 @@ function Widget:getAbsoluteRect()
 end
 
 ---@since 0.1.0
+---@return integer width
+---@return integer height
+function Widget:getSize()
+	return self.width, self.height
+end
+
+---@since 0.1.0
 
 ---@param px integer
 ---@param py integer
@@ -3213,6 +3220,17 @@ end
 function Frame:setSize(width, height)
 	Widget.setSize(self, width, height)
 	self:_applyConstraintsToChildren()
+	local handler = self.onSizeChange
+	if type(handler) == "function" then
+		handler(self, width, height)
+	end
+end
+
+function Frame:setOnSizeChange(handler)
+	if handler ~= nil then
+		expect(1, handler, "function")
+	end
+	self.onSizeChange = handler
 end
 
 ---@since 0.1.0
