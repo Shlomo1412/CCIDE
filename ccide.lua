@@ -192,22 +192,38 @@ local state = {
 	diagnosticsExpanded = false,
 	showEditorBorder = true,
 	showHomeScreen = true,
-	maxRecentFiles = 12
+	maxRecentFiles = 12,
+	buffers = {},
+	activeBufferIndex = 0,
+	activeBuffer = nil,
+	nextBufferId = 1
 }
 
 local app = pixelui.create({ background = colors.black })
 local root = app:getRoot()
 root:setBorder({ color = colors.gray })
 
+local TAB_CONTROL_HEIGHT = 1
+local TAB_CONTROL_Y = 2
+
+local function getEditorTopY()
+	return TAB_CONTROL_Y + TAB_CONTROL_HEIGHT
+end
+
+local tabControl
+
 -- Forward declarations
 local updateMainVisibility
+local updateDiagnosticsView
+local hasUnsavedChanges
+local confirmUnsaved
 
 -- Forward declarations
 local updateMainVisibility
 
 local rootWidth, rootHeight = root.width, root.height
-local editorHeight = math.max(1, rootHeight - 2)
 local statusBarY = rootHeight
+local editorHeight = math.max(1, rootHeight - getEditorTopY() - 1)
 
 local menuBar = app:createFrame({
 	x = 1,
@@ -218,6 +234,23 @@ local menuBar = app:createFrame({
 	fg = colors.white
 })
 root:addChild(menuBar)
+
+tabControl = app:createTabControl({
+	x = 1,
+	y = TAB_CONTROL_Y,
+	width = rootWidth,
+	height = TAB_CONTROL_HEIGHT,
+	tabHeight = TAB_CONTROL_HEIGHT,
+	tabPadding = 2,
+	tabSpacing = 1,
+	tabIndicator = { char = ">", spacing = 1 },
+	tabCloseButton = { enabled = true, char = "x", spacing = 1, fg = colors.white, bg = colors.red },
+	bodyBg = colors.black,
+	bodyFg = colors.white,
+	focusable = true
+})
+tabControl.visible = false
+root:addChild(tabControl)
 
 local statusLabel = app:createLabel({
 	x = 1,
@@ -245,7 +278,7 @@ diagnosticsToggleButton.focusable = false
 
 local editor = app:createTextBox({
 	x = 1,
-	y = 2,
+	y = getEditorTopY(),
 	width = rootWidth,
 	height = editorHeight,
 	bg = colors.black,
@@ -263,7 +296,7 @@ root:addChild(editor)
 root:addChild(statusLabel)
 root:addChild(diagnosticsToggleButton)
 
-local maxDiagHeight = math.max(0, rootHeight - 3)
+local maxDiagHeight = math.max(0, rootHeight - getEditorTopY() - 1)
 local diagnosticsPanelHeight = math.min(5, maxDiagHeight)
 local diagnosticsPanel
 local diagnosticsList
@@ -316,25 +349,47 @@ local function updateDiagnosticsToggle()
 	end
 end
 
+local function updateDiagnosticsView()
+	local diagnostics = state.diagnostics or {}
+	if diagnosticsList then
+		local items = {}
+		for i = 1, #diagnostics do
+			local entry = diagnostics[i]
+			local severity = entry and entry.severity or "error"
+			local prefix = severity == "warning" and "W" or "E"
+			local line = entry and entry.line and tostring(entry.line) or "?"
+			local message = entry and entry.message or ""
+			items[#items + 1] = string.format("%s %s: %s", prefix, line, message)
+		end
+		diagnosticsList:setItems(items)
+		if #items == 0 then
+			diagnosticsList:setSelectedIndex(0)
+		end
+	end
+	updateDiagnosticsToggle()
+end
+
 local function layoutEditorAndDiagnostics()
 	if not editor then
 		return
 	end
 	local diagHeight = 0
 	if state.diagnosticsExpanded and diagnosticsPanel and diagnosticsPanelHeight > 0 then
-		diagHeight = diagnosticsPanelHeight
+		diagHeight = math.min(diagnosticsPanelHeight, math.max(0, rootHeight - getEditorTopY() - 1))
 	else
 		state.diagnosticsExpanded = false
 	end
-	local newEditorHeight = math.max(1, rootHeight - diagHeight - 2)
+	local editorTop = getEditorTopY()
+	local newEditorHeight = math.max(1, statusBarY - diagHeight - editorTop)
+	editor:setPosition(1, editorTop)
 	editor:setSize(rootWidth, newEditorHeight)
 	if diagnosticsPanel then
 		if diagHeight > 0 then
 			diagnosticsPanel.visible = true
-			diagnosticsPanel:setPosition(1, statusBarY - diagnosticsPanelHeight)
-			diagnosticsPanel:setSize(rootWidth, diagnosticsPanelHeight)
+			diagnosticsPanel:setPosition(1, statusBarY - diagHeight)
+			diagnosticsPanel:setSize(rootWidth, diagHeight)
 			if diagnosticsList then
-				diagnosticsList:setSize(rootWidth, diagnosticsPanelHeight)
+				diagnosticsList:setSize(rootWidth, diagHeight)
 				diagnosticsList:setPosition(1, 1)
 			end
 		else
@@ -385,6 +440,314 @@ local function showHomeScreen()
 	if updateMainVisibility then updateMainVisibility() end
 end
 
+local function createBuffer(params)
+	params = params or {}
+	local id = state.nextBufferId or 1
+	state.nextBufferId = id + 1
+	return {
+		id = id,
+		path = params.path,
+		pendingPath = params.pendingPath,
+		displayName = params.displayName or string.format("Untitled-%d", id),
+		savedText = params.savedText or "",
+		text = params.text or params.savedText or "",
+		dirty = params.dirty or false,
+		isUntitled = params.isUntitled ~= false,
+		cursorLine = params.cursorLine or 1,
+		cursorCol = params.cursorCol or 1,
+		selectionLength = params.selectionLength or 0,
+		diagnostics = params.diagnostics or {},
+		diagnosticsExpanded = params.diagnosticsExpanded or false
+	}
+end
+
+local function findBufferByPath(path)
+	if not path then
+		return nil, nil
+	end
+	for index, buffer in ipairs(state.buffers) do
+		if buffer.path == path then
+			return index, buffer
+		end
+	end
+	return nil, nil
+end
+
+local function formatTabLabel(buffer)
+	if not buffer then
+		return "Untitled"
+	end
+	local label = buffer.displayName or "Untitled"
+	if buffer.dirty then
+		label = "* " .. label
+	end
+	return label
+end
+
+local function refreshTabLabel(index)
+	if not tabControl then
+		return
+	end
+	local buffer = state.buffers[index]
+	if not buffer then
+		return
+	end
+	tabControl:setTabLabel(index, formatTabLabel(buffer))
+end
+
+local function refreshAllTabLabels()
+	if not tabControl then
+		return
+	end
+	for index = 1, #state.buffers do
+		refreshTabLabel(index)
+	end
+end
+
+local function line_col_to_index(lines, line, col)
+	lines = lines or { "" }
+	line = math.max(1, math.min(line or 1, #lines))
+	col = math.max(1, col or 1)
+	local index = 1
+	for i = 1, line - 1 do
+		index = index + #lines[i] + 1
+	end
+	return index + math.min(col - 1, #lines[line])
+end
+
+local function syncStateToBuffer(buffer)
+	if not buffer then
+		return
+	end
+	buffer.path = state.path
+	buffer.pendingPath = state.pendingPath
+	buffer.displayName = state.displayName
+	buffer.savedText = state.savedText
+	buffer.dirty = state.dirty
+	buffer.isUntitled = state.isUntitled
+	buffer.cursorLine = state.cursorLine or buffer.cursorLine
+	buffer.cursorCol = state.cursorCol or buffer.cursorCol
+	buffer.selectionLength = state.selectionLength or buffer.selectionLength
+	buffer.diagnostics = state.diagnostics or buffer.diagnostics
+	buffer.diagnosticsExpanded = state.diagnosticsExpanded or buffer.diagnosticsExpanded
+	if editor then
+		buffer.text = editor:getText()
+	end
+end
+
+local function syncBufferToState(buffer)
+	if not buffer then
+		state.path = nil
+		state.pendingPath = nil
+		state.displayName = nil
+		state.savedText = ""
+		state.dirty = false
+		state.isUntitled = true
+		state.cursorLine = 1
+		state.cursorCol = 1
+		state.selectionLength = 0
+		state.diagnostics = {}
+		state.diagnosticsExpanded = false
+		if editor then
+			editor:setText("", true)
+			editor:_moveCursorToIndex(1)
+		end
+		updateDiagnosticsView()
+		layoutEditorAndDiagnostics()
+		updateStatus()
+		return
+	end
+	state.path = buffer.path
+	state.pendingPath = buffer.pendingPath
+	state.displayName = buffer.displayName
+	state.savedText = buffer.savedText or ""
+	state.dirty = buffer.dirty or false
+	state.isUntitled = buffer.isUntitled ~= false
+	state.cursorLine = buffer.cursorLine or 1
+	state.cursorCol = buffer.cursorCol or 1
+	state.selectionLength = buffer.selectionLength or 0
+	state.diagnostics = buffer.diagnostics or {}
+	state.diagnosticsExpanded = buffer.diagnosticsExpanded or false
+	if editor then
+		local text = buffer.text or buffer.savedText or ""
+		editor:setText(text, true)
+		local lines = split_lines(text)
+		local cursorIndex = line_col_to_index(lines, state.cursorLine, state.cursorCol)
+		editor:_moveCursorToIndex(cursorIndex)
+	end
+	updateDiagnosticsView()
+	layoutEditorAndDiagnostics()
+	updateStatus()
+	refreshTabLabel(state.activeBufferIndex)
+end
+
+local suppressTabSelect = false
+
+local function activateBufferByIndex(index, options)
+	options = options or {}
+	if index < 1 or index > #state.buffers then
+		return false
+	end
+	if state.activeBufferIndex ~= index or options.force then
+		syncStateToBuffer(state.activeBuffer)
+		state.activeBufferIndex = index
+		state.activeBuffer = state.buffers[index]
+		syncBufferToState(state.activeBuffer)
+		if tabControl and not options.skipTabSelect then
+			suppressTabSelect = true
+			tabControl:setSelectedIndex(index, true)
+			suppressTabSelect = false
+		end
+	end
+	state.showHomeScreen = false
+	if not options.skipVisibilityUpdate and updateMainVisibility then
+		updateMainVisibility()
+	end
+	if not options.skipFocus then
+		app:setFocus(editor)
+	end
+	return true
+end
+
+local function addBuffer(buffer, options)
+	options = options or {}
+	state.buffers[#state.buffers + 1] = buffer
+	if tabControl then
+		tabControl:addTab({
+			id = buffer.id,
+			label = formatTabLabel(buffer),
+			value = buffer.id,
+			closeable = true
+		})
+		if options.select ~= false then
+			activateBufferByIndex(#state.buffers, { skipTabSelect = true, skipFocus = options.skipFocus })
+			suppressTabSelect = true
+			tabControl:setSelectedIndex(state.activeBufferIndex, true)
+			suppressTabSelect = false
+		end
+	else
+		if options.select ~= false then
+			activateBufferByIndex(#state.buffers, { skipVisibilityUpdate = true })
+		end
+	end
+	refreshTabLabel(#state.buffers)
+end
+
+local function finalizeBufferRemoval(index)
+	suppressTabSelect = true
+	if tabControl then
+		tabControl:removeTab(index)
+	end
+	suppressTabSelect = false
+	table.remove(state.buffers, index)
+	if #state.buffers == 0 then
+		state.activeBuffer = nil
+		state.activeBufferIndex = 0
+		syncBufferToState(nil)
+		showHomeScreen()
+		if tabControl then
+			suppressTabSelect = true
+			tabControl:setSelectedIndex(0, true)
+			suppressTabSelect = false
+		end
+		return
+	end
+	local currentIndex = state.activeBufferIndex or 0
+	local newIndex
+	if index < currentIndex then
+		newIndex = currentIndex - 1
+	elseif index == currentIndex then
+		newIndex = math.min(index, #state.buffers)
+	else
+		newIndex = currentIndex
+	end
+	state.activeBuffer = nil
+	state.activeBufferIndex = 0
+	activateBufferByIndex(newIndex, { skipTabSelect = true })
+	if tabControl then
+		suppressTabSelect = true
+		tabControl:setSelectedIndex(state.activeBufferIndex, true)
+		suppressTabSelect = false
+	end
+	refreshAllTabLabels()
+end
+
+local function requestBufferActivation(index, onActivated)
+	if index < 1 or index > #state.buffers then
+		return
+	end
+	if state.activeBufferIndex == index then
+		if onActivated then
+			onActivated()
+		end
+		return
+	end
+	local previousIndex = state.activeBufferIndex
+	local function perform()
+		activateBufferByIndex(index, { skipTabSelect = true })
+		if tabControl then
+			suppressTabSelect = true
+			tabControl:setSelectedIndex(index, true)
+			suppressTabSelect = false
+		end
+		if onActivated then
+			onActivated()
+		end
+	end
+	if hasUnsavedChanges() then
+		if tabControl and previousIndex and previousIndex > 0 then
+			suppressTabSelect = true
+			tabControl:setSelectedIndex(previousIndex, true)
+			suppressTabSelect = false
+		end
+		confirmUnsaved(function()
+			perform()
+		end)
+	else
+		perform()
+	end
+end
+
+local function requestBufferClose(index)
+	local buffer = state.buffers[index]
+	if not buffer then
+		return
+	end
+	local function proceedClose()
+		syncStateToBuffer(state.activeBuffer)
+		finalizeBufferRemoval(index)
+	end
+	if state.activeBufferIndex ~= index then
+		local function afterSwitch()
+			requestBufferClose(state.activeBufferIndex)
+		end
+		local function switchFirst()
+			activateBufferByIndex(index, { skipTabSelect = true })
+			if tabControl then
+				suppressTabSelect = true
+				tabControl:setSelectedIndex(index, true)
+				suppressTabSelect = false
+			end
+			afterSwitch()
+		end
+		if hasUnsavedChanges() then
+			confirmUnsaved(function()
+				switchFirst()
+			end)
+		else
+			switchFirst()
+		end
+		return
+	end
+	if hasUnsavedChanges() then
+		confirmUnsaved(function()
+			proceedClose()
+		end)
+	else
+		proceedClose()
+	end
+end
+
 local function parseSyntaxError(err)
 	if not err or err == "" then
 		return nil, "syntax error"
@@ -396,29 +759,10 @@ local function parseSyntaxError(err)
 	return tonumber(line), message or err
 end
 
-local function updateDiagnosticsView()
-	local diagnostics = state.diagnostics or {}
-	if diagnosticsList then
-		local items = {}
-		for i = 1, #diagnostics do
-			local entry = diagnostics[i]
-			local severity = entry and entry.severity or "error"
-			local prefix = severity == "warning" and "W" or "E"
-			local line = entry and entry.line and tostring(entry.line) or "?"
-			local message = entry and entry.message or ""
-			items[#items + 1] = string.format("%s %s: %s", prefix, line, message)
-		end
-		diagnosticsList:setItems(items)
-		if #items == 0 then
-			diagnosticsList:setSelectedIndex(0)
-		end
-	end
-	updateDiagnosticsToggle()
-end
-
 local function recomputeDiagnosticsNow()
 	local diagnostics = {}
-	if editor then
+	local buffer = state.activeBuffer
+	if editor and buffer then
 		local text = editor:getText() or ""
 		local env = setmetatable({}, { __index = _G })
 		local chunk, err = load(text, state.path or "buffer", "t", env)
@@ -430,6 +774,9 @@ local function recomputeDiagnosticsNow()
 				message = message or err
 			}
 		end
+	end
+	if buffer then
+		buffer.diagnostics = diagnostics
 	end
 	state.diagnostics = diagnostics
 	updateDiagnosticsView()
@@ -455,10 +802,18 @@ end
 local function toggleDiagnosticsPanel()
 	if not diagnosticsPanel or diagnosticsPanelHeight <= 0 then
 		state.diagnosticsExpanded = false
+		local buffer = state.activeBuffer
+		if buffer then
+			buffer.diagnosticsExpanded = false
+		end
 		updateDiagnosticsToggle()
 		return
 	end
 	state.diagnosticsExpanded = not state.diagnosticsExpanded
+	local buffer = state.activeBuffer
+	if buffer then
+		buffer.diagnosticsExpanded = state.diagnosticsExpanded
+	end
 	layoutEditorAndDiagnostics()
 	if state.diagnosticsExpanded then
 		if diagnosticsUpdateThread then
@@ -1049,7 +1404,15 @@ local function showFileDialog(options)
 	local messageThread
 
 	local function updateDirtyState(text)
-		state.dirty = (text or "") ~= (state.savedText or "")
+		local buffer = state.activeBuffer
+		if buffer then
+			buffer.text = text or buffer.text or ""
+			buffer.dirty = (buffer.text or "") ~= (buffer.savedText or "")
+			state.dirty = buffer.dirty
+			refreshTabLabel(state.activeBufferIndex)
+		else
+			state.dirty = false
+		end
 	end
 
 	updateStatus = function()
@@ -1483,11 +1846,17 @@ local function showFileDialog(options)
 	end
 
 	local function hasUnsavedChanges()
-		if state.dirty then
-			return true
+	function hasUnsavedChanges()
+		local buffer = state.activeBuffer
+		if not buffer then
+			return false
 		end
-		return editor:getText() ~= (state.savedText or "")
-	end
+		if buffer.dirty ~= nil then
+			return buffer.dirty
+		end
+		return (buffer.text or editor:getText() or "") ~= (buffer.savedText or "")
+	return currentText ~= (buffer.savedText or "")
+end
 
 	local function showError(title, message)
 		local box = app:createMsgBox({
@@ -1533,24 +1902,39 @@ local function showFileDialog(options)
 		root:addChild(box)
 	end
 
+if tabControl then
+	tabControl:setOnSelect(function(_, _, index)
+		if suppressTabSelect or not index or index < 1 then
+			return
+		end
+		requestBufferActivation(index)
+	end)
+	tabControl:setOnCloseTab(function(_, _, index)
+		if not index or index < 1 then
+			return false
+		end
+		if suppressTabSelect then
+			return false
+		end
+		requestBufferClose(index)
+		return false
+	end)
+end
+
 	local function prepareEmptyBuffer(name, pendingPath)
 		hideHomeScreen()
-		editor:setText("", true)
-		editor:_moveCursorToIndex(1)
-		state.savedText = ""
-		state.dirty = false
-		state.isUntitled = true
-		state.path = nil
-		state.pendingPath = pendingPath
-		state.displayName = name or state.displayName or "Untitled"
-		state.cursorLine = 1
-		state.cursorCol = 1
-		state.selectionLength = 0
+		local buffer = createBuffer({
+			displayName = name or state.displayName or "Untitled",
+			pendingPath = pendingPath,
+			text = "",
+			savedText = "",
+			dirty = false,
+			isUntitled = true
+		})
+		addBuffer(buffer)
 		state.message = nil
-		state.diagnostics = {}
-		updateDiagnosticsView()
 		updateStatus()
-		app:setFocus(editor)
+		refreshTabLabel(state.activeBufferIndex)
 	end
 
 	local function saveToPath(targetPath)
@@ -1590,9 +1974,20 @@ local function showFileDialog(options)
 		state.savedText = text
 		state.dirty = false
 		state.isUntitled = false
+		local buffer = state.activeBuffer
+		if buffer then
+			buffer.path = normalized
+			buffer.pendingPath = nil
+			buffer.displayName = state.displayName
+			buffer.savedText = text
+			buffer.dirty = false
+			buffer.isUntitled = false
+			buffer.text = text
+		end
 		addRecentFile(normalized)
 		showStatusMessage("Saved to " .. normalized, 3)
 		updateStatus()
+		refreshTabLabel(state.activeBufferIndex)
 		return true
 	end
 
@@ -1610,7 +2005,13 @@ local function showFileDialog(options)
 			showError("Open Failed", "Cannot open a directory")
 			return false
 		end
-		hideHomeScreen()
+		local existingIndex = findBufferByPath(normalized)
+		if existingIndex then
+			hideHomeScreen()
+			activateBufferByIndex(existingIndex)
+			showStatusMessage("Switched to " .. normalized, 2)
+			return true
+		end
 		local handle, err = fs.open(normalized, "r")
 		if not handle then
 			showError("Open Failed", err or "Unable to read file")
@@ -1618,22 +2019,28 @@ local function showFileDialog(options)
 		end
 		local contents = handle.readAll() or ""
 		handle.close()
-		editor:setText(contents, true)
-		editor:_moveCursorToIndex(1)
-		state.path = normalized
-		state.pendingPath = nil
-		state.displayName = fs.getName(normalized)
-		state.savedText = editor:getText()
-		state.dirty = false
-		state.isUntitled = false
-		state.cursorLine = 1
-		state.cursorCol = 1
-		state.selectionLength = 0
+		hideHomeScreen()
+		local buffer = createBuffer({
+			path = normalized,
+			pendingPath = nil,
+			displayName = fs.getName(normalized),
+			text = contents,
+			savedText = contents,
+			dirty = false,
+			isUntitled = false,
+			cursorLine = 1,
+			cursorCol = 1,
+			selectionLength = 0,
+			diagnostics = {}
+		})
+		addBuffer(buffer)
+		buffer.text = contents
+		buffer.savedText = contents
+		buffer.dirty = false
+		syncBufferToState(buffer)
 		recomputeDiagnosticsNow()
 		addRecentFile(normalized)
 		showStatusMessage("Opened " .. normalized, 3)
-		updateStatus()
-		app:setFocus(editor)
 		return true
 	end
 
@@ -1689,16 +2096,6 @@ local function showFileDialog(options)
 				end
 			})
 		end)
-	end
-
-	local function line_col_to_index(lines, line, col)
-		line = math.max(1, math.min(line or 1, #lines))
-		col = math.max(1, col or 1)
-		local index = 1
-		for i = 1, line - 1 do
-			index = index + #lines[i] + 1
-		end
-		return index + math.min(col - 1, #lines[line])
 	end
 
 	if diagnosticsList then
@@ -1880,9 +2277,48 @@ local function showFileDialog(options)
 	end
 
 	local function requestExit()
-		confirmUnsaved(function()
-			app:stop()
-		end)
+		local function processNextBuffer()
+			syncStateToBuffer(state.activeBuffer)
+			local nextIndex
+			for i, buffer in ipairs(state.buffers) do
+				if buffer.dirty then
+					nextIndex = i
+					break
+				end
+			end
+			if not nextIndex then
+				if not hasUnsavedChanges() then
+					app:stop()
+				end
+				return
+			end
+			local function handleActiveBuffer()
+				local function continueExit()
+					state.dirty = false
+					local active = state.activeBuffer
+					if active then
+						active.dirty = false
+						refreshTabLabel(state.activeBufferIndex)
+					end
+					processNextBuffer()
+				end
+				if hasUnsavedChanges() then
+					confirmUnsaved(function()
+						continueExit()
+					end)
+				else
+					continueExit()
+				end
+			end
+			if state.activeBufferIndex ~= nextIndex then
+				requestBufferActivation(nextIndex, function()
+					handleActiveBuffer()
+				end)
+			else
+				handleActiveBuffer()
+			end
+		end
+		processNextBuffer()
 	end
 
 	local function buildFileMenuItems()
@@ -2113,7 +2549,8 @@ local function showFileDialog(options)
 	end
 
 	updateMainVisibility = function()
-		local showMain = not state.showHomeScreen
+		local hasBuffers = #state.buffers > 0
+		local showMain = not state.showHomeScreen and hasBuffers
 		editor.visible = showMain
 		statusLabel.visible = showMain and state.showStatusBar
 		if diagnosticsToggleButton then
@@ -2130,9 +2567,13 @@ local function showFileDialog(options)
 		if menuBar then
 			menuBar.visible = showMain
 		end
+		if tabControl then
+			tabControl.visible = showMain
+		end
 		if homeFrame then
-			homeFrame.visible = state.showHomeScreen
-			if state.showHomeScreen then
+			local showHome = state.showHomeScreen or not hasBuffers
+			homeFrame.visible = showHome
+			if showHome then
 				updateHomeScreenLayout()
 				refreshHomeScreen()
 				app:setFocus(newFileButton)
@@ -2185,6 +2626,12 @@ local function showFileDialog(options)
 		state.cursorLine = line or state.cursorLine or 1
 		state.cursorCol = col or state.cursorCol or 1
 		state.selectionLength = selectionLength or 0
+		local buffer = state.activeBuffer
+		if buffer then
+			buffer.cursorLine = state.cursorLine
+			buffer.cursorCol = state.cursorCol
+			buffer.selectionLength = state.selectionLength
+		end
 		updateStatus()
 	end)
 
@@ -2192,14 +2639,20 @@ local function showFileDialog(options)
 		if args and #args > 0 and args[1] then
 			if not loadFile(args[1]) then
 				local pending = normalize_path(args[1])
-				prepareEmptyBuffer(state.displayName, pending)
-				if pending then
-					state.pendingPath = pending
-					state.displayName = fs.getName(pending)
-					updateStatus()
+				local displayName = pending and fs.getName(pending) or (state.displayName or "Untitled-1")
+				prepareEmptyBuffer(displayName, pending)
+				local buffer = state.activeBuffer
+				if buffer then
+					buffer.displayName = displayName
+					buffer.pendingPath = pending
+					syncBufferToState(buffer)
+					refreshTabLabel(state.activeBufferIndex)
 				end
-				-- Show home screen only if we have an empty file with no specific path
-				state.showHomeScreen = not pending and editor:getText() == ""
+				if not pending then
+					showHomeScreen()
+				else
+					hideHomeScreen()
+				end
 			else
 				-- File was loaded successfully, don't show home screen
 				state.showHomeScreen = false
@@ -2207,7 +2660,7 @@ local function showFileDialog(options)
 		else
 			prepareEmptyBuffer(state.displayName or "Untitled-1", nil)
 			-- Show home screen for empty untitled files with no arguments
-			state.showHomeScreen = true
+			showHomeScreen()
 		end
 	end
 
@@ -2221,30 +2674,35 @@ local function showFileDialog(options)
 	end
 	
 	-- Set up resize handler for responsive layout
-		root:setOnSizeChange(function(_, newWidth, newHeight)
-			rootWidth = newWidth
-			rootHeight = newHeight
-			statusBarY = newHeight
-			if menuBar then
-				menuBar:setSize(rootWidth, 1)
-			end
-			if statusLabel then
-				statusLabel:setPosition(1, statusBarY)
-				statusLabel:setSize(math.max(1, rootWidth - 1), 1)
-			end
-			if diagnosticsToggleButton and statusLabel then
-				diagnosticsToggleButton:setPosition(statusLabel.x + statusLabel.width, statusBarY)
-			end
-			maxDiagHeight = math.max(0, rootHeight - 3)
-			diagnosticsPanelHeight = math.min(5, maxDiagHeight)
-			updateHomeScreenLayout()
-			layoutEditorAndDiagnostics()
-			refreshHomeScreen()
-			updateStatus()
-			if app and app.render then
-				app:render()
-			end
-		end)
+	root:setOnSizeChange(function(_, newWidth, newHeight)
+		rootWidth = newWidth
+		rootHeight = newHeight
+		statusBarY = newHeight
+		editorHeight = math.max(1, rootHeight - getEditorTopY() - 1)
+		if menuBar then
+			menuBar:setSize(rootWidth, 1)
+		end
+		if tabControl then
+			tabControl:setPosition(1, TAB_CONTROL_Y)
+			tabControl:setSize(rootWidth, TAB_CONTROL_HEIGHT)
+		end
+		if statusLabel then
+			statusLabel:setPosition(1, statusBarY)
+			statusLabel:setSize(math.max(1, rootWidth - 1), 1)
+		end
+		if diagnosticsToggleButton and statusLabel then
+			diagnosticsToggleButton:setPosition(statusLabel.x + statusLabel.width, statusBarY)
+		end
+		maxDiagHeight = math.max(0, rootHeight - getEditorTopY() - 1)
+		diagnosticsPanelHeight = math.min(5, maxDiagHeight)
+		updateHomeScreenLayout()
+		layoutEditorAndDiagnostics()
+		refreshHomeScreen()
+		updateStatus()
+		if app and app.render then
+			app:render()
+		end
+	end)
 	
 	app:run()
 
