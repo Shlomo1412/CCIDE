@@ -169,6 +169,284 @@ local LUA_SUGGESTIONS = {
 	"keys", "fs", "shell"
 }
 
+-- ═══════════════════════════════════════════════════════════════
+-- Lua Minifier
+-- Strips comments, unnecessary whitespace and blank lines while
+-- preserving string literals and producing functionally-identical output.
+-- ═══════════════════════════════════════════════════════════════
+
+local LUA_KEYWORDS = {
+	["and"] = true, ["break"] = true, ["do"] = true, ["else"] = true,
+	["elseif"] = true, ["end"] = true, ["false"] = true, ["for"] = true,
+	["function"] = true, ["goto"] = true, ["if"] = true, ["in"] = true,
+	["local"] = true, ["nil"] = true, ["not"] = true, ["or"] = true,
+	["repeat"] = true, ["return"] = true, ["then"] = true, ["true"] = true,
+	["until"] = true, ["while"] = true
+}
+
+local function minify_lua(source)
+	-- Tokenise the source preserving enough information to emit minimal whitespace.
+	-- Token types: "string", "comment", "number", "name", "op", "whitespace", "newline"
+	local tokens = {}
+	local pos = 1
+	local len = #source
+
+	local function peek(offset)
+		local p = pos + (offset or 0)
+		if p > len then return "" end
+		return source:sub(p, p)
+	end
+
+	local function match_long_bracket()
+		-- pos should point to '['
+		if source:sub(pos, pos) ~= "[" then return nil end
+		local level = 0
+		local p = pos + 1
+		while p <= len and source:sub(p, p) == "=" do
+			level = level + 1
+			p = p + 1
+		end
+		if p > len or source:sub(p, p) ~= "[" then return nil end
+		-- find matching close
+		local close = "]" .. string.rep("=", level) .. "]"
+		local closeStart = source:find(close, p + 1, true)
+		if not closeStart then
+			-- unterminated long bracket, take rest
+			return source:sub(pos, len), len + 1
+		end
+		local closeEnd = closeStart + #close - 1
+		return source:sub(pos, closeEnd), closeEnd + 1
+	end
+
+	while pos <= len do
+		local ch = source:sub(pos, pos)
+
+		-- Long comment --[=*[...]=*]
+		if ch == "-" and source:sub(pos, pos + 1) == "--" then
+			local savedPos = pos
+			pos = pos + 2
+			if pos <= len and source:sub(pos, pos) == "[" then
+				local lb, nextPos = match_long_bracket()
+				if lb then
+					tokens[#tokens + 1] = { type = "comment", value = "--" .. lb }
+					pos = nextPos
+				else
+					-- single-line comment
+					local eol = source:find("\n", pos, true)
+					if eol then
+						tokens[#tokens + 1] = { type = "comment", value = source:sub(savedPos, eol - 1) }
+						pos = eol
+					else
+						tokens[#tokens + 1] = { type = "comment", value = source:sub(savedPos) }
+						pos = len + 1
+					end
+				end
+			else
+				-- single-line comment
+				local eol = source:find("\n", pos, true)
+				if eol then
+					tokens[#tokens + 1] = { type = "comment", value = source:sub(savedPos, eol - 1) }
+					pos = eol
+				else
+					tokens[#tokens + 1] = { type = "comment", value = source:sub(savedPos) }
+					pos = len + 1
+				end
+			end
+
+		-- Long string [=*[...]=*]
+		elseif ch == "[" and (peek(1) == "[" or peek(1) == "=") then
+			local lb, nextPos = match_long_bracket()
+			if lb then
+				tokens[#tokens + 1] = { type = "string", value = lb }
+				pos = nextPos
+			else
+				tokens[#tokens + 1] = { type = "op", value = ch }
+				pos = pos + 1
+			end
+
+		-- Quoted strings
+		elseif ch == '"' or ch == "'" then
+			local quote = ch
+			local start = pos
+			pos = pos + 1
+			while pos <= len do
+				local c = source:sub(pos, pos)
+				if c == "\\" then
+					pos = pos + 2 -- skip escaped char
+				elseif c == quote then
+					pos = pos + 1
+					break
+				elseif c == "\n" then
+					-- unterminated string on this line
+					break
+				else
+					pos = pos + 1
+				end
+			end
+			tokens[#tokens + 1] = { type = "string", value = source:sub(start, pos - 1) }
+
+		-- Numbers (including hex, binary, float, exponent)
+		elseif ch:match("%d") or (ch == "." and peek(1):match("%d")) then
+			local start = pos
+			if ch == "0" and (peek(1) == "x" or peek(1) == "X") then
+				pos = pos + 2
+				while pos <= len and source:sub(pos, pos):match("[%da-fA-F_]") do pos = pos + 1 end
+			elseif ch == "0" and (peek(1) == "b" or peek(1) == "B") then
+				pos = pos + 2
+				while pos <= len and source:sub(pos, pos):match("[01_]") do pos = pos + 1 end
+			else
+				while pos <= len and source:sub(pos, pos):match("[%d_]") do pos = pos + 1 end
+				if pos <= len and source:sub(pos, pos) == "." then
+					pos = pos + 1
+					while pos <= len and source:sub(pos, pos):match("[%d_]") do pos = pos + 1 end
+				end
+				if pos <= len and (source:sub(pos, pos) == "e" or source:sub(pos, pos) == "E") then
+					pos = pos + 1
+					if pos <= len and (source:sub(pos, pos) == "+" or source:sub(pos, pos) == "-") then
+						pos = pos + 1
+					end
+					while pos <= len and source:sub(pos, pos):match("[%d_]") do pos = pos + 1 end
+				end
+			end
+			tokens[#tokens + 1] = { type = "number", value = source:sub(start, pos - 1) }
+
+		-- Names / keywords
+		elseif ch:match("[%a_]") then
+			local start = pos
+			while pos <= len and source:sub(pos, pos):match("[%w_]") do pos = pos + 1 end
+			local word = source:sub(start, pos - 1)
+			tokens[#tokens + 1] = { type = "name", value = word }
+
+		-- Newlines
+		elseif ch == "\n" then
+			tokens[#tokens + 1] = { type = "newline", value = "\n" }
+			pos = pos + 1
+		elseif ch == "\r" then
+			if peek(1) == "\n" then pos = pos + 1 end
+			tokens[#tokens + 1] = { type = "newline", value = "\n" }
+			pos = pos + 1
+
+		-- Whitespace (spaces, tabs)
+		elseif ch:match("%s") then
+			local start = pos
+			while pos <= len and source:sub(pos, pos):match("[ \t]") do pos = pos + 1 end
+			tokens[#tokens + 1] = { type = "whitespace", value = source:sub(start, pos - 1) }
+
+		-- Multi-char operators
+		elseif ch == "." and peek(1) == "." then
+			if peek(2) == "." then
+				tokens[#tokens + 1] = { type = "op", value = "..." }
+				pos = pos + 3
+			else
+				tokens[#tokens + 1] = { type = "op", value = ".." }
+				pos = pos + 2
+			end
+		elseif ch == "=" and peek(1) == "=" then
+			tokens[#tokens + 1] = { type = "op", value = "==" }
+			pos = pos + 2
+		elseif ch == "~" and peek(1) == "=" then
+			tokens[#tokens + 1] = { type = "op", value = "~=" }
+			pos = pos + 2
+		elseif ch == "<" and peek(1) == "=" then
+			tokens[#tokens + 1] = { type = "op", value = "<=" }
+			pos = pos + 2
+		elseif ch == ">" and peek(1) == "=" then
+			tokens[#tokens + 1] = { type = "op", value = ">=" }
+			pos = pos + 2
+		elseif ch == "<" and peek(1) == "<" then
+			tokens[#tokens + 1] = { type = "op", value = "<<" }
+			pos = pos + 2
+		elseif ch == ">" and peek(1) == ">" then
+			tokens[#tokens + 1] = { type = "op", value = ">>" }
+			pos = pos + 2
+		elseif ch == ":" and peek(1) == ":" then
+			tokens[#tokens + 1] = { type = "op", value = "::" }
+			pos = pos + 2
+		elseif ch == "/" and peek(1) == "/" then
+			tokens[#tokens + 1] = { type = "op", value = "//" }
+			pos = pos + 2
+
+		-- Single-char operators / punctuation
+		else
+			tokens[#tokens + 1] = { type = "op", value = ch }
+			pos = pos + 1
+		end
+	end
+
+	-- Emit phase: skip comments, collapse whitespace, insert minimal spacing
+	local parts = {}
+	local prevToken = nil -- last emitted non-ws/non-comment token
+
+	local function needs_separator(a, b)
+		-- Two adjacent name/number/keyword tokens need at least one space
+		if not a or not b then return false end
+		local at, bt = a.type, b.type
+		if (at == "name" or at == "number") and (bt == "name" or bt == "number") then
+			return true
+		end
+		-- ".." after a number could be confused (1..x → 1 ..x)
+		if at == "number" and bt == "op" and b.value:sub(1, 1) == "." then
+			return true
+		end
+		-- a name/keyword before a string literal needs space to avoid ambiguity (e.g. return"x")
+		-- Actually in Lua this is valid, but safer to keep space for readability edge cases
+		if at == "name" and bt == "string" then
+			-- Only needed if the string starts with a long bracket (return[=[...]=])
+			if b.value:sub(1, 1) == "[" then return true end
+		end
+		-- "-" after operator "-" would form "--" comment
+		if at == "op" and a.value == "-" and bt == "op" and b.value:sub(1, 1) == "-" then
+			return true
+		end
+		return false
+	end
+
+	for i = 1, #tokens do
+		local tok = tokens[i]
+		if tok.type == "comment" then
+			-- skip comments entirely
+		elseif tok.type == "whitespace" then
+			-- skip, we add separators as needed
+		elseif tok.type == "newline" then
+			-- We'll insert newlines only when necessary (after statements that need them)
+			-- For safety, treat consecutive newlines as one, emit a newline to separate statements
+			if prevToken and prevToken.type ~= "newline_emitted" then
+				-- Check if the next meaningful token exists
+				local hasNext = false
+				for j = i + 1, #tokens do
+					if tokens[j].type ~= "whitespace" and tokens[j].type ~= "newline" and tokens[j].type ~= "comment" then
+						hasNext = true
+						break
+					end
+				end
+				if hasNext then
+					parts[#parts + 1] = "\n"
+					prevToken = { type = "newline_emitted", value = "\n" }
+				end
+			end
+		else
+			-- Meaningful token
+			if needs_separator(prevToken, tok) then
+				parts[#parts + 1] = " "
+			end
+			parts[#parts + 1] = tok.value
+			prevToken = tok
+		end
+	end
+
+	local result = table.concat(parts)
+	-- Remove trailing whitespace on lines and collapse multiple blank lines
+	local lines = split_lines(result)
+	local out = {}
+	for i = 1, #lines do
+		local line = lines[i]:gsub("%s+$", "")
+		if line ~= "" then
+			out[#out + 1] = line
+		end
+	end
+	return table.concat(out, "\n") .. "\n"
+end
+
 local state = {
 	path = nil,
 	pendingPath = nil,
@@ -377,6 +655,140 @@ if diagnosticsPanelHeight > 0 then
 	})
 	diagnosticsList.focusable = true
 	diagnosticsPanel:addChild(diagnosticsList)
+end
+
+-- ═══════════════════════════════════════════════════════════════
+-- Loading / Progress Indicators
+-- ═══════════════════════════════════════════════════════════════
+
+-- Background task indicator (top-right, compact)
+local LOADING_IND_WIDTH = 22
+local LOADING_IND_HEIGHT = 3
+local loadingIndicator = app:createFrame({
+	x = math.max(1, rootWidth - LOADING_IND_WIDTH),
+	y = 2,
+	width = LOADING_IND_WIDTH,
+	height = LOADING_IND_HEIGHT,
+	bg = colors.gray,
+	fg = colors.white,
+	border = { color = colors.lightGray }
+})
+loadingIndicator.visible = false
+loadingIndicator.z = 100
+
+local loadingLabel = app:createLabel({
+	x = 2, y = 1,
+	width = LOADING_IND_WIDTH - 2, height = 1,
+	text = "Loading...",
+	bg = colors.gray, fg = colors.white,
+	align = "left"
+})
+loadingIndicator:addChild(loadingLabel)
+
+local loadingProgressBar = app:createProgressBar({
+	x = 2, y = 2,
+	width = LOADING_IND_WIDTH - 2, height = 1,
+	min = 0, max = 1, value = 0,
+	trackColor = colors.lightGray,
+	fillColor = colors.lightBlue,
+	indeterminate = true,
+	border = false
+})
+loadingProgressBar:setBorder(false)
+loadingIndicator:addChild(loadingProgressBar)
+root:addChild(loadingIndicator)
+
+-- Full-screen loading overlay for app startup
+local loadingOverlay = app:createFrame({
+	x = 1, y = 1,
+	width = rootWidth, height = rootHeight,
+	bg = colors.black, fg = colors.white
+})
+loadingOverlay.visible = false
+loadingOverlay.z = 200
+
+local loadingOverlayTitle = app:createLabel({
+	x = 1, y = math.max(1, math.floor(rootHeight / 2) - 1),
+	width = rootWidth, height = 1,
+	text = "CCIDE", bg = colors.black, fg = colors.lightBlue,
+	align = "center"
+})
+loadingOverlay:addChild(loadingOverlayTitle)
+
+local loadingOverlayMsg = app:createLabel({
+	x = 1, y = math.max(1, math.floor(rootHeight / 2)),
+	width = rootWidth, height = 1,
+	text = "Starting...", bg = colors.black, fg = colors.gray,
+	align = "center"
+})
+loadingOverlay:addChild(loadingOverlayMsg)
+
+local loadingOverlayBar = app:createProgressBar({
+	x = math.max(1, math.floor((rootWidth - 20) / 2) + 1),
+	y = math.max(1, math.floor(rootHeight / 2) + 2),
+	width = 20, height = 1,
+	min = 0, max = 1, value = 0,
+	trackColor = colors.gray,
+	fillColor = colors.lightBlue,
+	border = false
+})
+loadingOverlayBar:setBorder(false)
+loadingOverlay:addChild(loadingOverlayBar)
+root:addChild(loadingOverlay)
+
+--- Show the background loading indicator with a label and optional progress.
+--- @param label string The label to display
+--- @param progress number|nil Progress 0-1 or nil for indeterminate
+local function showLoadingIndicator(label, progress)
+	loadingLabel:setText(truncate(label or "Loading...", LOADING_IND_WIDTH - 2))
+	if progress then
+		loadingProgressBar:setIndeterminate(false)
+		loadingProgressBar:setValue(progress)
+	else
+		loadingProgressBar:setIndeterminate(true)
+	end
+	-- Reposition to top-right
+	loadingIndicator:setPosition(math.max(1, rootWidth - LOADING_IND_WIDTH), 2)
+	loadingIndicator.visible = true
+end
+
+--- Hide the background loading indicator.
+local function hideLoadingIndicator()
+	loadingIndicator.visible = false
+end
+
+--- Show the full-screen loading overlay.
+--- @param title string|nil Title text
+--- @param message string|nil Status message
+--- @param progress number|nil Progress 0-1 or nil for indeterminate
+local function showLoadingOverlay(title, message, progress)
+	loadingOverlayTitle:setText(title or "CCIDE")
+	loadingOverlayMsg:setText(message or "Loading...")
+	if progress then
+		loadingOverlayBar:setIndeterminate(false)
+		loadingOverlayBar:setValue(progress)
+	else
+		loadingOverlayBar:setIndeterminate(true)
+	end
+	loadingOverlay.visible = true
+end
+
+--- Update the loading overlay progress.
+--- @param message string|nil Status message
+--- @param progress number|nil Progress 0-1
+local function updateLoadingOverlay(message, progress)
+	if message then
+		loadingOverlayMsg:setText(message)
+	end
+	if progress then
+		loadingOverlayBar:setIndeterminate(false)
+		loadingOverlayBar:setValue(progress)
+	end
+end
+
+--- Hide the full-screen loading overlay.
+local function hideLoadingOverlay()
+	loadingOverlay.visible = false
 end
 
 local updateStatus
@@ -2171,8 +2583,11 @@ end
 			showStatusMessage("Switched to " .. normalized, 2)
 			return true
 		end
+		-- Show loading indicator while reading file
+		showLoadingIndicator("Opening " .. fs.getName(normalized))
 		local handle, err = fs.open(normalized, "r")
 		if not handle then
+			hideLoadingIndicator()
 			showError("Open Failed", err or "Unable to read file")
 			return false
 		end
@@ -2199,6 +2614,7 @@ end
 		syncBufferToState(buffer)
 		recomputeDiagnosticsNow()
 		addRecentFile(normalized)
+		hideLoadingIndicator()
 		showStatusMessage("Opened " .. normalized, 3)
 		return true
 	end
@@ -2241,6 +2657,81 @@ end
 			return saved
 		end
 		return saveAs(onSaved)
+	end
+
+	local function saveMinifiedToPath(targetPath)
+		local normalized = normalize_path(targetPath)
+		if not normalized then
+			showError("Save Failed", "Invalid path")
+			return false
+		end
+		local dir = parent_dir(normalized)
+		if dir and dir ~= "/" and not fs.exists(dir) then
+			local ok, err = pcall(fs.makeDir, dir)
+			if not ok then
+				showError("Save Failed", err or ("Unable to create " .. dir))
+				return false
+			end
+		end
+		showLoadingIndicator("Minifying...")
+		local text = editor:getText()
+		local minified = minify_lua(text)
+		-- Validate the minified output parses correctly
+		local chunk, parseErr = load(minified, normalized, "t", {})
+		if not chunk then
+			hideLoadingIndicator()
+			showError("Minify Failed", "Minified code has syntax errors:\n" .. (parseErr or "unknown"))
+			return false
+		end
+		showLoadingIndicator("Saving...", 0.7)
+		local ok, err = pcall(function()
+			local handle = fs.open(normalized, "w")
+			if not handle then
+				error("Unable to open file for writing", 0)
+			end
+			handle.write(minified)
+			handle.close()
+		end)
+		if not ok then
+			hideLoadingIndicator()
+			showError("Save Failed", err)
+			return false
+		end
+		hideLoadingIndicator()
+		local origSize = #text
+		local minSize = #minified
+		local pct = origSize > 0 and math.floor((1 - minSize / origSize) * 100) or 0
+		showStatusMessage(string.format("Minified & saved (%d%% smaller) %s", pct, normalized), 4)
+		return true
+	end
+
+	local function saveAsMinified()
+		local startPath = state.path and parent_dir(state.path) or (state.pendingPath and parent_dir(state.pendingPath)) or working_directory()
+		local baseName = state.path and fs.getName(state.path) or (state.pendingPath and fs.getName(state.pendingPath)) or state.displayName or "Untitled"
+		-- Suggest a .min.lua name
+		local defaultName = baseName:gsub("%.lua$", "") .. ".min.lua"
+		showFileDialog({
+			mode = "save",
+			startPath = startPath,
+			defaultName = defaultName,
+			onComplete = function(success, selected)
+				if success and selected then
+					saveMinifiedToPath(selected)
+				end
+			end
+		})
+	end
+
+	local function saveMinified()
+		if state.path then
+			local dir = parent_dir(state.path)
+			local baseName = fs.getName(state.path):gsub("%.lua$", "")
+			local minPath = dir .. "/" .. baseName .. ".min.lua"
+			minPath = normalize_path(minPath)
+			saveMinifiedToPath(minPath)
+		else
+			saveAsMinified()
+		end
 	end
 
 	local function openFileWorkflow()
@@ -2505,6 +2996,12 @@ end
 			end },
 			{ label = "Save As...", onSelect = function()
 				saveAs()
+			end },
+			{ label = "Save & Minify", onSelect = function()
+				saveMinified()
+			end },
+			{ label = "Save As & Minify...", onSelect = function()
+				saveAsMinified()
 			end },
 			"-"
 		}
@@ -3022,7 +3519,14 @@ end
 		end
 	end
 
+	-- Show startup loading screen
+	showLoadingOverlay("CCIDE", "Initializing...", 0)
+	updateLoadingOverlay("Loading UI...", 0.2)
+
 	initializeFromArgs()
+	updateLoadingOverlay("Ready", 1.0)
+	hideLoadingOverlay()
+
 	updateStatus()
 	updateMainVisibility()
 	if state.showHomeScreen then
@@ -3114,6 +3618,18 @@ end
 		end
 		maxDiagHeight = math.max(0, rootHeight - getEditorTopY() - 1)
 		diagnosticsPanelHeight = math.min(5, maxDiagHeight)
+		-- Reposition loading indicators
+		if loadingIndicator then
+			loadingIndicator:setPosition(math.max(1, rootWidth - LOADING_IND_WIDTH), 2)
+		end
+		if loadingOverlay and loadingOverlay.visible then
+			loadingOverlay:setSize(rootWidth, rootHeight)
+			loadingOverlayTitle:setPosition(1, math.max(1, math.floor(rootHeight / 2) - 1))
+			loadingOverlayTitle:setSize(rootWidth, 1)
+			loadingOverlayMsg:setPosition(1, math.max(1, math.floor(rootHeight / 2)))
+			loadingOverlayMsg:setSize(rootWidth, 1)
+			loadingOverlayBar:setPosition(math.max(1, math.floor((rootWidth - 20) / 2) + 1), math.max(1, math.floor(rootHeight / 2) + 2))
+		end
 		updateHomeScreenLayout()
 		layoutEditorAndDiagnostics()
 		refreshHomeScreen()
