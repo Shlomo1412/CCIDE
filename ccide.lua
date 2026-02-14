@@ -196,7 +196,10 @@ local state = {
 	buffers = {},
 	activeBufferIndex = 0,
 	activeBuffer = nil,
-	nextBufferId = 1
+	nextBufferId = 1,
+	splitActive = false,
+	splitDirection = "horizontal",
+	activePaneIndex = 1
 }
 
 local app = pixelui.create({ background = colors.black })
@@ -293,6 +296,51 @@ local editor = app:createTextBox({
 })
 
 root:addChild(editor)
+
+local splitEditor = app:createTextBox({
+	x = 1,
+	y = getEditorTopY(),
+	width = rootWidth,
+	height = editorHeight,
+	bg = colors.black,
+	fg = colors.white,
+	scrollbar = { enabled = true, trackColor = colors.black, thumbColor = colors.gray },
+	tabWidth = state.tabSize,
+	syntax = "lua",
+	autocomplete = LUA_SUGGESTIONS,
+	autocompleteAuto = state.autocompleteEnabled,
+	autocompleteMaxItems = 8,
+	autocompleteBorder = { color = colors.gray }
+})
+splitEditor.visible = false
+root:addChild(splitEditor)
+
+local splitDivider = app:createFrame({
+	x = 1,
+	y = getEditorTopY(),
+	width = rootWidth,
+	height = 1,
+	bg = colors.gray,
+	fg = colors.gray
+})
+splitDivider.visible = false
+root:addChild(splitDivider)
+
+local function getActiveEditor()
+	if state.splitActive and splitEditor and app:getFocus() == splitEditor then
+		return splitEditor, 2
+	end
+	return editor, 1
+end
+
+local function focusActiveEditor()
+	if state.splitActive and state.activePaneIndex == 2 and splitEditor then
+		app:setFocus(splitEditor)
+	else
+		app:setFocus(editor)
+	end
+end
+
 root:addChild(statusLabel)
 root:addChild(diagnosticsToggleButton)
 
@@ -380,9 +428,51 @@ local function layoutEditorAndDiagnostics()
 		state.diagnosticsExpanded = false
 	end
 	local editorTop = getEditorTopY()
-	local newEditorHeight = math.max(1, statusBarY - diagHeight - editorTop)
-	editor:setPosition(1, editorTop)
-	editor:setSize(rootWidth, newEditorHeight)
+	local totalEditorHeight = math.max(1, statusBarY - diagHeight - editorTop)
+
+	if state.splitActive and splitEditor then
+		if state.splitDirection == "horizontal" then
+			-- Top/bottom split
+			local dividerHeight = 1
+			local availableHeight = totalEditorHeight - dividerHeight
+			local primaryHeight = math.max(1, math.floor(availableHeight / 2))
+			local splitHeight = math.max(1, availableHeight - primaryHeight)
+
+			editor:setPosition(1, editorTop)
+			editor:setSize(rootWidth, primaryHeight)
+
+			splitDivider:setPosition(1, editorTop + primaryHeight)
+			splitDivider:setSize(rootWidth, dividerHeight)
+			splitDivider.visible = true
+
+			splitEditor:setPosition(1, editorTop + primaryHeight + dividerHeight)
+			splitEditor:setSize(rootWidth, splitHeight)
+			splitEditor.visible = true
+		else
+			-- Left/right split
+			local dividerWidth = 1
+			local availableWidth = rootWidth - dividerWidth
+			local primaryWidth = math.max(1, math.floor(availableWidth / 2))
+			local splitWidth = math.max(1, availableWidth - primaryWidth)
+
+			editor:setPosition(1, editorTop)
+			editor:setSize(primaryWidth, totalEditorHeight)
+
+			splitDivider:setPosition(1 + primaryWidth, editorTop)
+			splitDivider:setSize(dividerWidth, totalEditorHeight)
+			splitDivider.visible = true
+
+			splitEditor:setPosition(1 + primaryWidth + dividerWidth, editorTop)
+			splitEditor:setSize(splitWidth, totalEditorHeight)
+			splitEditor.visible = true
+		end
+	else
+		editor:setPosition(1, editorTop)
+		editor:setSize(rootWidth, totalEditorHeight)
+		if splitEditor then splitEditor.visible = false end
+		if splitDivider then splitDivider.visible = false end
+	end
+
 	if diagnosticsPanel then
 		if diagHeight > 0 then
 			diagnosticsPanel.visible = true
@@ -405,8 +495,14 @@ local function applyEditorBorder()
 	end
 	if state.showEditorBorder then
 		editor:setBorder({ color = colors.gray })
+		if splitEditor and splitEditor.setBorder then
+			splitEditor:setBorder({ color = colors.gray })
+		end
 	else
 		editor:setBorder(false)
+		if splitEditor and splitEditor.setBorder then
+			splitEditor:setBorder(false)
+		end
 	end
 end
 
@@ -457,7 +553,10 @@ local function createBuffer(params)
 		cursorCol = params.cursorCol or 1,
 		selectionLength = params.selectionLength or 0,
 		diagnostics = params.diagnostics or {},
-		diagnosticsExpanded = params.diagnosticsExpanded or false
+		diagnosticsExpanded = params.diagnosticsExpanded or false,
+		splitCursorLine = params.splitCursorLine or 1,
+		splitCursorCol = params.splitCursorCol or 1,
+		splitSelectionLength = params.splitSelectionLength or 0
 	}
 end
 
@@ -533,6 +632,11 @@ local function syncStateToBuffer(buffer)
 	if editor then
 		buffer.text = editor:getText()
 	end
+	if splitEditor and state.splitActive then
+		local sLine, sCol = splitEditor:getCursorPosition()
+		buffer.splitCursorLine = sLine or 1
+		buffer.splitCursorCol = sCol or 1
+	end
 end
 
 local function syncBufferToState(buffer)
@@ -551,6 +655,10 @@ local function syncBufferToState(buffer)
 		if editor then
 			editor:setText("", true)
 			editor:_moveCursorToIndex(1)
+		end
+		if splitEditor then
+			splitEditor:setText("", true)
+			splitEditor:_moveCursorToIndex(1)
 		end
 		updateDiagnosticsView()
 		layoutEditorAndDiagnostics()
@@ -574,6 +682,12 @@ local function syncBufferToState(buffer)
 		local lines = split_lines(text)
 		local cursorIndex = line_col_to_index(lines, state.cursorLine, state.cursorCol)
 		editor:_moveCursorToIndex(cursorIndex)
+		if splitEditor and state.splitActive then
+			splitEditor:_setTextInternal(text, false, true)
+			local sLines = split_lines(text)
+			local sCursorIndex = line_col_to_index(sLines, buffer.splitCursorLine or 1, buffer.splitCursorCol or 1)
+			splitEditor:_moveCursorToIndex(sCursorIndex)
+		end
 	end
 	updateDiagnosticsView()
 	layoutEditorAndDiagnostics()
@@ -827,7 +941,7 @@ local function toggleDiagnosticsPanel()
 		end
 	end
 	if not state.diagnosticsExpanded then
-		app:setFocus(editor)
+		focusActiveEditor()
 	end
 	app:render()
 end
@@ -1129,7 +1243,7 @@ local function showFileDialog(options)
 			if dialog.parent then
 				dialog.parent:removeChild(dialog)
 			end
-			app:setFocus(editor)
+			focusActiveEditor()
 		end
 
 		local function rebuildEntries()
@@ -1368,7 +1482,7 @@ local function showFileDialog(options)
 			if dialog.parent then
 				dialog.parent:removeChild(dialog)
 			end
-			app:setFocus(editor)
+			focusActiveEditor()
 		end
 
 		local function submit()
@@ -1686,7 +1800,7 @@ local function showFileDialog(options)
 		end
 
 		box:setOnResult(function()
-			app:setFocus(editor)
+			focusActiveEditor()
 		end)
 
 		root:addChild(box)
@@ -1753,7 +1867,7 @@ local function showFileDialog(options)
 			if self.parent then
 				self.parent:removeChild(self)
 			end
-			app:setFocus(editor)
+			focusActiveEditor()
 			return result
 		end
 
@@ -1813,7 +1927,8 @@ local function showFileDialog(options)
 				button.onClick = function()
 					closeDialog()
 					local char = string.char(code)
-					editor:_insertTextAtCursor(char)
+					local activeEd = getActiveEditor()
+					activeEd:_insertTextAtCursor(char)
 					scheduleDiagnosticsUpdate()
 					showStatusMessage(string.format("Inserted char %d (0x%02X)", code, code), 2)
 				end
@@ -1845,7 +1960,6 @@ local function showFileDialog(options)
 		end
 	end
 
-	local function hasUnsavedChanges()
 	function hasUnsavedChanges()
 		local buffer = state.activeBuffer
 		if not buffer then
@@ -1855,8 +1969,7 @@ local function showFileDialog(options)
 			return buffer.dirty
 		end
 		return (buffer.text or editor:getText() or "") ~= (buffer.savedText or "")
-	return currentText ~= (buffer.savedText or "")
-end
+	end
 
 	local function showError(title, message)
 		local box = app:createMsgBox({
@@ -1865,7 +1978,7 @@ end
 			buttons = { { id = "ok", label = "OK" } }
 		})
 		box:setOnResult(function()
-			app:setFocus(editor)
+			focusActiveEditor()
 		end)
 		root:addChild(box)
 	end
@@ -1897,7 +2010,7 @@ end
 			elseif id == "discard" then
 				onContinue()
 			end
-			app:setFocus(editor)
+			focusActiveEditor()
 		end)
 		root:addChild(box)
 	end
@@ -2108,9 +2221,10 @@ end
 			end
 			local now = os.clock()
 			if entry.line and now - lastSelectTime < 0.35 then
-				local lines = split_lines(editor:getText())
-				editor:_moveCursorToIndex(line_col_to_index(lines, entry.line, entry.column or 1))
-				app:setFocus(editor)
+				local activeEd = getActiveEditor()
+				local lines = split_lines(activeEd:getText())
+				activeEd:_moveCursorToIndex(line_col_to_index(lines, entry.line, entry.column or 1))
+				focusActiveEditor()
 			end
 			lastSelectTime = now
 		end)
@@ -2221,6 +2335,9 @@ end
 	local function toggleAutocomplete()
 		state.autocompleteEnabled = not state.autocompleteEnabled
 		editor.autocompleteAuto = state.autocompleteEnabled
+		if splitEditor then
+			splitEditor.autocompleteAuto = state.autocompleteEnabled
+		end
 		showStatusMessage(state.autocompleteEnabled and "Autocomplete enabled" or "Autocomplete disabled", 2)
 	end
 
@@ -2235,6 +2352,10 @@ end
 		end
 		editor:setText(state.savedText, true)
 		editor:_moveCursorToIndex(1)
+		if state.splitActive and splitEditor then
+			splitEditor:_setTextInternal(state.savedText, false, true)
+			splitEditor:_moveCursorToIndex(1)
+		end
 		state.dirty = false
 		state.message = nil
 		scheduleDiagnosticsUpdate()
@@ -2371,15 +2492,86 @@ end
 		return items
 	end
 
+	local function toggleSplitView()
+		state.splitActive = not state.splitActive
+		if state.splitActive then
+			-- Initialize split editor with current buffer text
+			if splitEditor then
+				local text = editor:getText() or ""
+				splitEditor:setText(text, true)
+				local buffer = state.activeBuffer
+				if buffer then
+					local sLines = split_lines(text)
+					local sCursorIndex = line_col_to_index(sLines, buffer.splitCursorLine or 1, buffer.splitCursorCol or 1)
+					splitEditor:_moveCursorToIndex(sCursorIndex)
+				end
+				splitEditor.visible = true
+				if splitDivider then splitDivider.visible = true end
+				applyEditorBorder()
+			end
+			showStatusMessage("Split view enabled", 2)
+		else
+			state.activePaneIndex = 1
+			if splitEditor then splitEditor.visible = false end
+			if splitDivider then splitDivider.visible = false end
+			app:setFocus(editor)
+			showStatusMessage("Split view disabled", 2)
+		end
+		layoutEditorAndDiagnostics()
+	end
+
+	local function switchSplitDirection()
+		if not state.splitActive then return end
+		if state.splitDirection == "horizontal" then
+			state.splitDirection = "vertical"
+			showStatusMessage("Split: left/right", 2)
+		else
+			state.splitDirection = "horizontal"
+			showStatusMessage("Split: top/bottom", 2)
+		end
+		layoutEditorAndDiagnostics()
+	end
+
+	local function focusSplitPane(paneIndex)
+		if not state.splitActive then return end
+		if paneIndex == 2 and splitEditor then
+			state.activePaneIndex = 2
+			app:setFocus(splitEditor)
+			local sLine, sCol = splitEditor:getCursorPosition()
+			state.cursorLine = sLine or 1
+			state.cursorCol = sCol or 1
+		else
+			state.activePaneIndex = 1
+			app:setFocus(editor)
+			local pLine, pCol = editor:getCursorPosition()
+			state.cursorLine = pLine or 1
+			state.cursorCol = pCol or 1
+		end
+		updateStatus()
+	end
+
 	local function buildViewMenuItems()
-		return {
+		local items = {
 			{ label = state.showStatusBar and "Hide Status Bar" or "Show Status Bar", onSelect = function()
 				toggleStatusBar()
 			end },
 			{ label = state.showEditorBorder and "Hide Editor Border" or "Show Editor Border", onSelect = function()
 				toggleEditorBorder()
+			end },
+			"-",
+			{ label = state.splitActive and "Close Split View" or "Split Editor", onSelect = function()
+				toggleSplitView()
 			end }
 		}
+		if state.splitActive then
+			items[#items + 1] = { label = state.splitDirection == "horizontal" and "Split Left/Right" or "Split Top/Bottom", onSelect = function()
+				switchSplitDirection()
+			end }
+			items[#items + 1] = { label = "Switch Pane", onSelect = function()
+				focusSplitPane(state.activePaneIndex == 1 and 2 or 1)
+			end }
+		end
+		return items
 	end
 
 	local function buildEditMenuItems()
@@ -2559,6 +2751,12 @@ end
 		if diagnosticsPanel then
 			diagnosticsPanel.visible = showMain and state.diagnosticsExpanded
 		end
+		if splitEditor then
+			splitEditor.visible = showMain and state.splitActive
+		end
+		if splitDivider then
+			splitDivider.visible = showMain and state.splitActive
+		end
 		for _, button in pairs(topButtons or {}) do
 			if button and button.visible ~= nil then
 				button.visible = showMain
@@ -2618,21 +2816,59 @@ end
 		if text and text ~= "" and state.showHomeScreen then
 			hideHomeScreen()
 		end
+		-- Sync text to split editor (preserve split cursor)
+		if state.splitActive and splitEditor then
+			splitEditor:_setTextInternal(text or "", false, true)
+		end
 		updateStatus()
 		scheduleDiagnosticsUpdate()
 	end)
 
 	editor:setOnCursorMove(function(_, line, col, selectionLength)
-		state.cursorLine = line or state.cursorLine or 1
-		state.cursorCol = col or state.cursorCol or 1
-		state.selectionLength = selectionLength or 0
 		local buffer = state.activeBuffer
 		if buffer then
-			buffer.cursorLine = state.cursorLine
-			buffer.cursorCol = state.cursorCol
-			buffer.selectionLength = state.selectionLength
+			buffer.cursorLine = line or 1
+			buffer.cursorCol = col or 1
+			buffer.selectionLength = selectionLength or 0
+		end
+		-- Only update status bar cursor info if this pane has focus
+		if not state.splitActive or app:getFocus() == editor then
+			state.activePaneIndex = 1
+			state.cursorLine = line or state.cursorLine or 1
+			state.cursorCol = col or state.cursorCol or 1
+			state.selectionLength = selectionLength or 0
+			updateStatus()
+		end
+	end)
+
+	-- Split editor event handlers
+	splitEditor:setOnChange(function(_, text)
+		-- Sync text back to primary editor (preserve primary cursor)
+		if editor then
+			editor:_setTextInternal(text or "", false, true)
+		end
+		updateDirtyState(text or "")
+		if text and text ~= "" and state.showHomeScreen then
+			hideHomeScreen()
 		end
 		updateStatus()
+		scheduleDiagnosticsUpdate()
+	end)
+
+	splitEditor:setOnCursorMove(function(_, line, col, selectionLength)
+		local buffer = state.activeBuffer
+		if buffer then
+			buffer.splitCursorLine = line or 1
+			buffer.splitCursorCol = col or 1
+			buffer.splitSelectionLength = selectionLength or 0
+		end
+		if app:getFocus() == splitEditor then
+			state.activePaneIndex = 2
+			state.cursorLine = line or 1
+			state.cursorCol = col or 1
+			state.selectionLength = selectionLength or 0
+			updateStatus()
+		end
 	end)
 
 	local function initializeFromArgs()
