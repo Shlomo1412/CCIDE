@@ -199,7 +199,11 @@ local state = {
 	nextBufferId = 1,
 	splitActive = false,
 	splitDirection = "horizontal",
-	activePaneIndex = 1
+	activePaneIndex = 1,
+	splitRatio = 0.5,
+	splitBufferIndex = 0,
+	splitBuffer = nil,
+	_splitDragging = false
 }
 
 local app = pixelui.create({ background = colors.black })
@@ -431,11 +435,12 @@ local function layoutEditorAndDiagnostics()
 	local totalEditorHeight = math.max(1, statusBarY - diagHeight - editorTop)
 
 	if state.splitActive and splitEditor then
+		local ratio = math.max(0.1, math.min(0.9, state.splitRatio or 0.5))
 		if state.splitDirection == "horizontal" then
 			-- Top/bottom split
 			local dividerHeight = 1
 			local availableHeight = totalEditorHeight - dividerHeight
-			local primaryHeight = math.max(1, math.floor(availableHeight / 2))
+			local primaryHeight = math.max(1, math.floor(availableHeight * ratio))
 			local splitHeight = math.max(1, availableHeight - primaryHeight)
 
 			editor:setPosition(1, editorTop)
@@ -452,7 +457,7 @@ local function layoutEditorAndDiagnostics()
 			-- Left/right split
 			local dividerWidth = 1
 			local availableWidth = rootWidth - dividerWidth
-			local primaryWidth = math.max(1, math.floor(availableWidth / 2))
+			local primaryWidth = math.max(1, math.floor(availableWidth * ratio))
 			local splitWidth = math.max(1, availableWidth - primaryWidth)
 
 			editor:setPosition(1, editorTop)
@@ -553,10 +558,7 @@ local function createBuffer(params)
 		cursorCol = params.cursorCol or 1,
 		selectionLength = params.selectionLength or 0,
 		diagnostics = params.diagnostics or {},
-		diagnosticsExpanded = params.diagnosticsExpanded or false,
-		splitCursorLine = params.splitCursorLine or 1,
-		splitCursorCol = params.splitCursorCol or 1,
-		splitSelectionLength = params.splitSelectionLength or 0
+		diagnosticsExpanded = params.diagnosticsExpanded or false
 	}
 end
 
@@ -632,11 +634,39 @@ local function syncStateToBuffer(buffer)
 	if editor then
 		buffer.text = editor:getText()
 	end
-	if splitEditor and state.splitActive then
-		local sLine, sCol = splitEditor:getCursorPosition()
-		buffer.splitCursorLine = sLine or 1
-		buffer.splitCursorCol = sCol or 1
+end
+
+--- Save split editor cursor state back to its buffer
+local function syncSplitEditorToBuffer()
+	local sbuf = state.splitBuffer
+	if not sbuf or not splitEditor then return end
+	sbuf.text = splitEditor:getText()
+	local sLine, sCol = splitEditor:getCursorPosition()
+	sbuf.cursorLine = sLine or 1
+	sbuf.cursorCol = sCol or 1
+	-- recalculate dirty for the split buffer
+	sbuf.dirty = (sbuf.text or "") ~= (sbuf.savedText or "")
+end
+
+--- Load a buffer into the split editor pane
+local function loadBufferIntoSplit(buffer)
+	if not splitEditor or not buffer then return end
+	-- Save current split buffer state first
+	syncSplitEditorToBuffer()
+	state.splitBuffer = buffer
+	state.splitBufferIndex = 0
+	-- Find the buffer index
+	for i, b in ipairs(state.buffers) do
+		if b == buffer then
+			state.splitBufferIndex = i
+			break
+		end
 	end
+	local text = buffer.text or buffer.savedText or ""
+	splitEditor:setText(text, true)
+	local lines = split_lines(text)
+	local cursorIndex = line_col_to_index(lines, buffer.cursorLine or 1, buffer.cursorCol or 1)
+	splitEditor:_moveCursorToIndex(cursorIndex)
 end
 
 local function syncBufferToState(buffer)
@@ -655,10 +685,6 @@ local function syncBufferToState(buffer)
 		if editor then
 			editor:setText("", true)
 			editor:_moveCursorToIndex(1)
-		end
-		if splitEditor then
-			splitEditor:setText("", true)
-			splitEditor:_moveCursorToIndex(1)
 		end
 		updateDiagnosticsView()
 		layoutEditorAndDiagnostics()
@@ -682,12 +708,6 @@ local function syncBufferToState(buffer)
 		local lines = split_lines(text)
 		local cursorIndex = line_col_to_index(lines, state.cursorLine, state.cursorCol)
 		editor:_moveCursorToIndex(cursorIndex)
-		if splitEditor and state.splitActive then
-			splitEditor:_setTextInternal(text, false, true)
-			local sLines = split_lines(text)
-			local sCursorIndex = line_col_to_index(sLines, buffer.splitCursorLine or 1, buffer.splitCursorCol or 1)
-			splitEditor:_moveCursorToIndex(sCursorIndex)
-		end
 	end
 	updateDiagnosticsView()
 	layoutEditorAndDiagnostics()
@@ -748,6 +768,23 @@ local function addBuffer(buffer, options)
 end
 
 local function finalizeBufferRemoval(index)
+	-- If the removed buffer is the split buffer, close the split pane
+	local removedBuffer = state.buffers[index]
+	if state.splitActive and removedBuffer and removedBuffer == state.splitBuffer then
+		state.splitBuffer = nil
+		state.splitBufferIndex = 0
+		if splitEditor then
+			splitEditor:setText("", true)
+		end
+		-- If only one buffer remains after removal, close split view entirely
+		if #state.buffers <= 1 then
+			state.splitActive = false
+			state.activePaneIndex = 1
+			if splitEditor then splitEditor.visible = false end
+			if splitDivider then splitDivider.visible = false end
+			app:setFocus(editor)
+		end
+	end
 	suppressTabSelect = true
 	if tabControl then
 		tabControl:removeTab(index)
@@ -1543,8 +1580,17 @@ local function showFileDialog(options)
 			statusLabel:setText(truncate("", statusLabel.width))
 			return
 		end
-		local name = state.path and fs.getName(state.path) or state.displayName or "Untitled"
-		local dirtyMark = state.dirty and "*" or ""
+		local name, dirtyMark, displayPath
+		if state.splitActive and state.activePaneIndex == 2 and state.splitBuffer then
+			local sbuf = state.splitBuffer
+			name = sbuf.path and fs.getName(sbuf.path) or sbuf.displayName or "Untitled"
+			dirtyMark = sbuf.dirty and "*" or ""
+			displayPath = sbuf.path
+		else
+			name = state.path and fs.getName(state.path) or state.displayName or "Untitled"
+			dirtyMark = state.dirty and "*" or ""
+			displayPath = state.path
+		end
 		local width = statusLabel.width or rootWidth
 		local rightParts = {
 			string.format("Ln %d", state.cursorLine or 1),
@@ -1568,8 +1614,8 @@ local function showFileDialog(options)
 		local leftParts = { name .. dirtyMark }
 		if state.message and state.message ~= "" then
 			leftParts[#leftParts + 1] = state.message
-		elseif state.path then
-			leftParts[#leftParts + 1] = state.path
+		elseif displayPath then
+			leftParts[#leftParts + 1] = displayPath
 		end
 		local leftText = table.concat(leftParts, "  ")
 		if leftCapacity == 0 then
@@ -2495,15 +2541,11 @@ end
 	local function toggleSplitView()
 		state.splitActive = not state.splitActive
 		if state.splitActive then
-			-- Initialize split editor with current buffer text
 			if splitEditor then
-				local text = editor:getText() or ""
-				splitEditor:setText(text, true)
+				-- Load the current buffer into the split pane by default
 				local buffer = state.activeBuffer
 				if buffer then
-					local sLines = split_lines(text)
-					local sCursorIndex = line_col_to_index(sLines, buffer.splitCursorLine or 1, buffer.splitCursorCol or 1)
-					splitEditor:_moveCursorToIndex(sCursorIndex)
+					loadBufferIntoSplit(buffer)
 				end
 				splitEditor.visible = true
 				if splitDivider then splitDivider.visible = true end
@@ -2511,7 +2553,11 @@ end
 			end
 			showStatusMessage("Split view enabled", 2)
 		else
+			-- Save split buffer state before closing
+			syncSplitEditorToBuffer()
 			state.activePaneIndex = 1
+			state.splitBuffer = nil
+			state.splitBufferIndex = 0
 			if splitEditor then splitEditor.visible = false end
 			if splitDivider then splitDivider.visible = false end
 			app:setFocus(editor)
@@ -2570,6 +2616,67 @@ end
 			items[#items + 1] = { label = "Switch Pane", onSelect = function()
 				focusSplitPane(state.activePaneIndex == 1 and 2 or 1)
 			end }
+			items[#items + 1] = "-"
+			items[#items + 1] = { label = "Open File in Split Pane...", onSelect = function()
+				showFileDialog({
+					mode = "open",
+					startPath = state.path and parent_dir(state.path) or working_directory(),
+					onComplete = function(success, selected)
+						if success and selected then
+							local normalized = normalize_path(selected)
+							if not normalized or not fs.exists(normalized) or fs.isDir(normalized) then
+								showError("Open Failed", "Cannot open " .. (selected or "file"))
+								return
+							end
+							-- Check if buffer already exists
+							local existingIndex = findBufferByPath(normalized)
+							if existingIndex then
+								loadBufferIntoSplit(state.buffers[existingIndex])
+								showStatusMessage("Split: " .. fs.getName(normalized), 2)
+								return
+							end
+							-- Read and create new buffer
+							local handle, err = fs.open(normalized, "r")
+							if not handle then
+								showError("Open Failed", err or "Unable to read file")
+								return
+							end
+							local contents = handle.readAll() or ""
+							handle.close()
+							local buffer = createBuffer({
+								path = normalized,
+								displayName = fs.getName(normalized),
+								text = contents,
+								savedText = contents,
+								dirty = false,
+								isUntitled = false,
+								cursorLine = 1,
+								cursorCol = 1,
+								selectionLength = 0,
+								diagnostics = {}
+							})
+							addBuffer(buffer)
+							buffer.text = contents
+							buffer.savedText = contents
+							loadBufferIntoSplit(buffer)
+							addRecentFile(normalized)
+							showStatusMessage("Split: " .. fs.getName(normalized), 2)
+						end
+					end
+				})
+			end }
+			-- Add open buffer submenu items
+			if #state.buffers > 1 then
+				items[#items + 1] = "-"
+				for i, buf in ipairs(state.buffers) do
+					local bufLabel = buf.displayName or ("Buffer " .. i)
+					if buf.dirty then bufLabel = bufLabel .. " *" end
+					items[#items + 1] = { label = "Split: " .. bufLabel, onSelect = function()
+						loadBufferIntoSplit(buf)
+						showStatusMessage("Split: " .. (buf.displayName or "buffer"), 2)
+					end }
+				end
+			end
 		end
 		return items
 	end
@@ -2816,8 +2923,8 @@ end
 		if text and text ~= "" and state.showHomeScreen then
 			hideHomeScreen()
 		end
-		-- Sync text to split editor (preserve split cursor)
-		if state.splitActive and splitEditor then
+		-- If split pane shows the same buffer, refresh it
+		if state.splitActive and splitEditor and state.splitBuffer == state.activeBuffer then
 			splitEditor:_setTextInternal(text or "", false, true)
 		end
 		updateStatus()
@@ -2843,11 +2950,27 @@ end
 
 	-- Split editor event handlers
 	splitEditor:setOnChange(function(_, text)
-		-- Sync text back to primary editor (preserve primary cursor)
-		if editor then
-			editor:_setTextInternal(text or "", false, true)
+		local sbuf = state.splitBuffer
+		if sbuf then
+			sbuf.text = text or ""
+			sbuf.dirty = (sbuf.text) ~= (sbuf.savedText or "")
+			-- If split shows the same buffer as primary, refresh primary editor
+			if sbuf == state.activeBuffer then
+				if editor then
+					editor:_setTextInternal(text or "", false, true)
+				end
+				state.dirty = sbuf.dirty
+				refreshTabLabel(state.activeBufferIndex)
+			else
+				-- Refresh the split buffer's tab label
+				for i, b in ipairs(state.buffers) do
+					if b == sbuf then
+						refreshTabLabel(i)
+						break
+					end
+				end
+			end
 		end
-		updateDirtyState(text or "")
 		if text and text ~= "" and state.showHomeScreen then
 			hideHomeScreen()
 		end
@@ -2856,11 +2979,10 @@ end
 	end)
 
 	splitEditor:setOnCursorMove(function(_, line, col, selectionLength)
-		local buffer = state.activeBuffer
-		if buffer then
-			buffer.splitCursorLine = line or 1
-			buffer.splitCursorCol = col or 1
-			buffer.splitSelectionLength = selectionLength or 0
+		local sbuf = state.splitBuffer
+		if sbuf then
+			sbuf.cursorLine = line or 1
+			sbuf.cursorCol = col or 1
 		end
 		if app:getFocus() == splitEditor then
 			state.activePaneIndex = 2
@@ -2909,6 +3031,67 @@ end
 		app:setFocus(editor)
 	end
 	
+	-- Divider drag handling
+	local originalStep = app.step
+	function app:step(event, ...)
+		if state.splitActive and state._splitDragging then
+			if event == "mouse_drag" then
+				local _btn, mx, my = ...
+				local editorTop = getEditorTopY()
+				local diagHeight = 0
+				if state.diagnosticsExpanded and diagnosticsPanel and diagnosticsPanelHeight > 0 then
+					diagHeight = math.min(diagnosticsPanelHeight, math.max(0, rootHeight - editorTop - 1))
+				end
+				local totalEditorHeight = math.max(1, statusBarY - diagHeight - editorTop)
+				if state.splitDirection == "horizontal" then
+					local dividerHeight = 1
+					local availableHeight = totalEditorHeight - dividerHeight
+					if availableHeight > 0 then
+						local newRatio = (my - editorTop) / availableHeight
+						state.splitRatio = math.max(0.1, math.min(0.9, newRatio))
+						layoutEditorAndDiagnostics()
+						self:render()
+					end
+				else
+					local dividerWidth = 1
+					local availableWidth = rootWidth - dividerWidth
+					if availableWidth > 0 then
+						local newRatio = (mx - 1) / availableWidth
+						state.splitRatio = math.max(0.1, math.min(0.9, newRatio))
+						layoutEditorAndDiagnostics()
+						self:render()
+					end
+				end
+				return
+			elseif event == "mouse_up" then
+				state._splitDragging = false
+				return originalStep(self, event, ...)
+			end
+		end
+		if state.splitActive and event == "mouse_click" and splitDivider and splitDivider.visible then
+			local _btn, mx, my = ...
+			local dx, dy = splitDivider.x, splitDivider.y
+			if splitDivider.parent then
+				-- compute absolute position
+				local pax, pay = 0, 0
+				local p = splitDivider.parent
+				while p and p.parent do
+					pax = pax + (p.x or 1) - 1
+					pay = pay + (p.y or 1) - 1
+					p = p.parent
+				end
+				dx = dx + pax
+				dy = dy + pay
+			end
+			local dw, dh = splitDivider.width, splitDivider.height
+			if mx >= dx and mx < dx + dw and my >= dy and my < dy + dh then
+				state._splitDragging = true
+				return
+			end
+		end
+		return originalStep(self, event, ...)
+	end
+
 	-- Set up resize handler for responsive layout
 	root:setOnSizeChange(function(_, newWidth, newHeight)
 		rootWidth = newWidth
